@@ -848,6 +848,18 @@ u64 BufferCache::ReadbackQueue::Submit(std::span<const Job> jobs, std::span<cons
     Vulkan::Check(cmdbuf.begin(vk::CommandBufferBeginInfo{
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     }));
+    const u64 signal_tick = semaphore.NextTick();
+    if (Vulkan::GpuCrashDiag::Blackbox()) {
+        u32 copies = 0;
+        for (const Job& job : jobs) copies += static_cast<u32>(job.copies.size());
+        Vulkan::GpuCrashDiag::MarkBox(this, Vulkan::CommandRecorder{cmdbuf}, signal_tick,
+                                      Vulkan::GpuCrashDiag::Entry{
+                                          .kind = Vulkan::GpuCrashDiag::Kind::Readback,
+                                          .count = copies,
+                                          .address = signal_tick,
+                                      },
+                                      Vulkan::GpuCrashDiag::Context{});
+    }
     for (const Job& job : jobs) {
         cmdbuf.copyBuffer(job.src, job.dst, job.copies);
     }
@@ -864,7 +876,6 @@ u64 BufferCache::ReadbackQueue::Submit(std::span<const Job> jobs, std::span<cons
     });
     Vulkan::Check(cmdbuf.end());
 
-    const u64 signal_tick = semaphore.NextTick();
     const vk::Semaphore signal_semaphore = semaphore.Handle();
     // The waits make the writes of the submissions up to their ticks available and visible to
     // the copies.
@@ -896,6 +907,10 @@ u64 BufferCache::ReadbackQueue::Submit(std::span<const Job> jobs, std::span<cons
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &signal_semaphore,
     };
+    Vulkan::GpuCrashDiag::NoteSubmit(this, "readback");
+    Vulkan::GpuCrashDiag::NoteSubmitSemaphores(
+        this, std::span{wait_semaphores.data(), num_waits}, std::span{wait_ticks.data(), num_waits},
+        std::span{&signal_semaphore, 1}, std::span{&signal_tick, 1});
     const auto result = instance.GetReadbackQueue().submit(submit_info);
     if (result == vk::Result::eErrorDeviceLost) {
         Vulkan::GpuCrashDiag::ReportDeviceLost(instance, "readback submit");

@@ -17,7 +17,11 @@ static uint64_t capacity(void){
         uint64_t requested=mb?strtoull(mb,NULL,10)*1048576u:0;
         if(!mb&&resolution&&sscanf(resolution,"%ux%u",&w,&h)==2&&(uint64_t)w*h>1920u*1080u)
             requested=UINT64_C(5632)*1048576u;
-        value=requested>=UINT64_C(0x120000000)&&requested<=UINT64_C(0x400000000)?requested&~UINT64_C(0xffffff):UINT64_C(0x120000000);
+        const int in_range=requested>=UINT64_C(0x120000000)&&requested<=UINT64_C(0x400000000);
+        value=in_range?requested&~UINT64_C(0xffffff):UINT64_C(0x120000000);
+        fprintf(stderr,"DIRECT_MEMORY %llu MB (%s)\n",(unsigned long long)(value>>20),
+                mb?(in_range?"ISS_DIRECT_MEMORY_MB":"ISS_DIRECT_MEMORY_MB out of range: default"):
+                requested?"above 1920x1080":"default");
     }
     return value;
 }

@@ -470,7 +470,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
-      draw_scheduler{instance}, present_scheduler{instance}, flip_scheduler{instance},
+      draw_scheduler{instance}, present_scheduler{instance, {}, "graphics (present)"},
+      flip_scheduler{instance, {}, "graphics (flip)"},
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
@@ -826,6 +827,19 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
         pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
     }
+    if (GpuCrashDiag::Blackbox()) {
+        GpuCrashDiag::MarkBox(&draw_scheduler,
+                              streamed ? draw_scheduler.Recorder() : CommandRecorder{cmdbuf},
+                              draw_scheduler.CurrentTick(),
+                              GpuCrashDiag::Entry{
+                                  .kind = GpuCrashDiag::Kind::PresentEnd,
+                                  .count = frame->width,
+                                  .instances = frame->height,
+                                  .dims = {image_size.width, image_size.height, 1},
+                                  .address = image.info.guest_address,
+                              },
+                              GpuCrashDiag::Context{});
+    }
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -971,6 +985,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
+    if (GpuCrashDiag::Blackbox()) {
+        const vk::Extent2D extent = swapchain.GetExtent();
+        GpuCrashDiag::MarkBox(&scheduler, CommandRecorder{cmdbuf}, scheduler.CurrentTick(),
+                              GpuCrashDiag::Entry{
+                                  .kind = GpuCrashDiag::Kind::PresentWindow,
+                                  .dims = {extent.width, extent.height, 1},
+                              },
+                              GpuCrashDiag::Context{});
+    }
     const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
 

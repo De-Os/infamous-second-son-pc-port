@@ -66,6 +66,24 @@ std::array<std::atomic<const char*>, NativeSlot> g_owner_name{};
 std::array<std::atomic<u64>, Slots> g_recorded{};
 std::array<std::atomic<u64>, Slots> g_submitted{};
 std::atomic<int> g_stall_reports{};
+
+/// The submissions of each slot: the marks they hold and the semaphores they wait for/signal.
+struct Submission {
+    std::atomic<u64> stamp; ///< number + 1 once written
+    u32 slot;
+    u64 first, last;        ///< marks recorded since the previous submission of the slot
+    double time;
+    u32 num_waits, num_signals;
+    u64 wait_semaphore[4], wait_value[4];
+    u64 signal_semaphore[2], signal_value[2];
+};
+constexpr u64 SubmissionRing = 1ull << 12;
+Submission* Submissions() {
+    static Submission* ring = new Submission[SubmissionRing]{};
+    return ring;
+}
+std::atomic<u64> g_submission_next{};
+std::array<std::atomic<u64>, Slots> g_last_submitted{};
 std::atomic<bool> g_crashed{};
 std::once_flag g_watch_once;
 std::once_flag g_crash_once;
@@ -229,6 +247,12 @@ const char* KindText(Kind kind) {
     case Kind::NativeSegment: return "SEGMENTO NATIVO";
     case Kind::NativeDraw: return "desenho nativo";
     case Kind::Present: return "APRESENTACAO (FSR/pos-processo do quadro)";
+    case Kind::PresentEnd: return "FIM da APRESENTACAO (pos-processo terminado)";
+    case Kind::SessionStart: return "INICIO de buffer de comandos (barreiras, copias, uploads antes do 1o desenho)";
+    case Kind::SessionUploads: return "UPLOADS do buffer (buffer de upload, roda antes dele)";
+    case Kind::SessionEnd: return "FIM de buffer de comandos";
+    case Kind::PresentWindow: return "JANELA: copia do quadro para a swapchain (thread de apresentacao, ImGui)";
+    case Kind::Readback: return "READBACK: copias para a CPU (fila de readback)";
     }
     return "?";
 }
@@ -273,9 +297,23 @@ std::string Describe(const Entry& e, const Context& c) {
                       e.dims[1], e.dims[2], (unsigned long long)e.address);
         return text;
     case Kind::Present:
+    case Kind::PresentEnd:
         std::snprintf(text, sizeof(text), "%s quadro %ux%u em %llx -> janela %ux%u",
                       KindText(e.kind), e.dims[0], e.dims[1], (unsigned long long)e.address,
                       e.count, e.instances);
+        return text;
+    case Kind::SessionStart:
+    case Kind::SessionUploads:
+    case Kind::SessionEnd:
+        std::snprintf(text, sizeof(text), "%s (tick %llu)", KindText(e.kind),
+                      (unsigned long long)e.tick);
+        return text;
+    case Kind::PresentWindow:
+        std::snprintf(text, sizeof(text), "%s %ux%u", KindText(e.kind), e.dims[0], e.dims[1]);
+        return text;
+    case Kind::Readback:
+        std::snprintf(text, sizeof(text), "%s %u copias, sinaliza %llu", KindText(e.kind), e.count,
+                      (unsigned long long)e.address);
         return text;
     case Kind::NativeSegment:
         std::snprintf(text, sizeof(text), "%s id %llu com %u desenhos, area %ux%u%s",
@@ -380,6 +418,9 @@ void Dump(const char* reason, const char* file_stem) {
         add("");
         add("== PROVAVEL CULPADO na fila %u: comandos #%llu..#%llu em andamento ==", slot,
             (unsigned long long)done, (unsigned long long)std::max(done, started));
+        add("   (a marca #N e escrita ANTES do comando N: tudo antes de #%llu terminou; o que trava"
+            " e o comando #%llu ou o que vem depois dele, antes da proxima marca da fila)",
+            (unsigned long long)done, (unsigned long long)std::max(done, started));
         for (u64 seq = done; seq <= std::max(done, started) && seq < done + 16; ++seq) {
             const Item* it = ItemAt(seq);
             if (!it) continue;
@@ -438,6 +479,50 @@ void Dump(const char* reason, const char* file_stem) {
         }
         add("checagem de memoria liberada: %d dos 40 comandos anteriores usam imagem apagada",
             freed_before);
+        add("");
+        add("-- os 12 comandos seguintes na fila %u (gravados, ainda nao iniciados) --", slot);
+        int listed = 0;
+        const u64 newest = g_seq.load(std::memory_order_relaxed);
+        for (u64 seq = std::max(done, started) + 1; seq < newest && listed < 12; ++seq) {
+            const Item* it = ItemAt(seq);
+            if (!it || it->slot != slot) continue;
+            ++listed;
+            add("   #%llu tick %llu [%s] %s", (unsigned long long)seq,
+                (unsigned long long)it->entry.tick, PathText(it->ctx.path),
+                Describe(it->entry, it->ctx).c_str());
+        }
+        add("");
+        add("-- envios (submits) da fila %u em volta dele: marcas, semaforos esperados/sinalizados --",
+            slot);
+        Submission* ring = Submissions();
+        const u64 last_sub = g_submission_next.load(std::memory_order_relaxed);
+        std::vector<u64> picked;
+        for (u64 n = last_sub; n > (last_sub > SubmissionRing ? last_sub - SubmissionRing : 0); --n) {
+            const Submission& sub = ring[(n - 1) & (SubmissionRing - 1)];
+            if (sub.stamp.load(std::memory_order_acquire) != n || sub.slot != slot) continue;
+            if (sub.last + 1 < done && picked.size() >= 3) break;
+            picked.push_back(n - 1);
+            if (picked.size() >= 8 && sub.last < done) break;
+        }
+        for (auto pit = picked.rbegin(); pit != picked.rend(); ++pit) {
+            const Submission& sub = ring[*pit & (SubmissionRing - 1)];
+            std::string waits, signals;
+            char item[96];
+            for (u32 i = 0; i < sub.num_waits; ++i) {
+                std::snprintf(item, sizeof(item), " %llx=%llu", (unsigned long long)sub.wait_semaphore[i],
+                              (unsigned long long)sub.wait_value[i]);
+                waits += item;
+            }
+            for (u32 i = 0; i < sub.num_signals; ++i) {
+                std::snprintf(item, sizeof(item), " %llx=%llu", (unsigned long long)sub.signal_semaphore[i],
+                              (unsigned long long)sub.signal_value[i]);
+                signals += item;
+            }
+            const bool here = sub.first <= std::max(done, started) + 1 && done <= sub.last;
+            add("   %s %.3f s: marcas #%llu..#%llu | espera:%s | sinaliza:%s", here ? ">>" : "  ",
+                sub.time, (unsigned long long)sub.first, (unsigned long long)sub.last,
+                waits.empty() ? " nada" : waits.c_str(), signals.empty() ? " nada" : signals.c_str());
+        }
     }
     if (culprits.empty()) add("(nenhuma fila com trabalho pendente marcado: o travamento pode ser fora dos comandos marcados)");
 
@@ -579,6 +664,56 @@ void NoteSubmit(const void* owner, const char* name) {
     box::g_owner_name[slot].store(name, std::memory_order_relaxed);
     box::g_submitted[slot].store(box::g_recorded[slot].load(std::memory_order_relaxed),
                                  std::memory_order_relaxed);
+}
+
+void NoteSubmitSemaphores(const void* owner, std::span<const vk::Semaphore> waits,
+                          std::span<const u64> wait_values, std::span<const vk::Semaphore> signals,
+                          std::span<const u64> signal_values) {
+    if (!box::g_marks.mapped) return;
+    const u32 slot = box::SlotOf(owner);
+    const u64 last = box::g_submitted[slot].load(std::memory_order_relaxed);
+    const u64 previous = box::g_last_submitted[slot].exchange(last, std::memory_order_relaxed);
+    const u64 n = box::g_submission_next.fetch_add(1, std::memory_order_relaxed);
+    box::Submission& sub = box::Submissions()[n & (box::SubmissionRing - 1)];
+    sub.stamp.store(0, std::memory_order_relaxed);
+    sub.slot = slot;
+    sub.first = previous + 1;
+    sub.last = last;
+    sub.time = box::Now();
+    sub.num_waits = u32(std::min<size_t>(waits.size(), 4));
+    for (u32 i = 0; i < sub.num_waits; ++i) {
+        sub.wait_semaphore[i] = reinterpret_cast<u64>(static_cast<VkSemaphore>(waits[i]));
+        sub.wait_value[i] = i < wait_values.size() ? wait_values[i] : 0;
+    }
+    sub.num_signals = u32(std::min<size_t>(signals.size(), 2));
+    for (u32 i = 0; i < sub.num_signals; ++i) {
+        sub.signal_semaphore[i] = reinterpret_cast<u64>(static_cast<VkSemaphore>(signals[i]));
+        sub.signal_value[i] = i < signal_values.size() ? signal_values[i] : 0;
+    }
+    sub.stamp.store(n + 1, std::memory_order_release);
+}
+
+u64 ReserveBox(const void* owner, u64 tick, const Entry& entry, const Context& ctx) {
+    if (!box::Ready()) return 0;
+    std::call_once(box::g_watch_once, [] { std::thread(box::Watch).detach(); });
+    const u64 seq = box::g_seq.fetch_add(1, std::memory_order_relaxed);
+    const u32 slot = box::SlotOf(owner);
+    box::Item& item = box::g_items[seq & (box::ItemRing - 1)];
+    item.entry = entry;
+    item.entry.seq = seq;
+    item.entry.tick = tick;
+    item.ctx = ctx;
+    item.slot = slot;
+    item.paused = iss::pause_guard::active.load(std::memory_order_relaxed);
+    item.time = box::Now();
+    item.seq = seq;
+    return seq;
+}
+
+void WriteReservedBox(VkCommandBuffer cmd, const void* owner, u64 seq) {
+    // Not counted as recorded: a later mark of the slot is (the stall check compares the last
+    // recorded and the last completed numbers).
+    if (seq && box::g_marks.mapped) box::WriteMarks(cmd, box::SlotOf(owner), u32(seq));
 }
 
 void BlackboxEventV(int category, const char* format, va_list args) {

@@ -105,6 +105,18 @@ const char* KindName(Kind kind) {
         return "native segment draw";
     case Kind::Present:
         return "present";
+    case Kind::PresentEnd:
+        return "present end";
+    case Kind::SessionStart:
+        return "command buffer start";
+    case Kind::SessionUploads:
+        return "command buffer uploads";
+    case Kind::SessionEnd:
+        return "command buffer end";
+    case Kind::PresentWindow:
+        return "present to window";
+    case Kind::Readback:
+        return "readback";
     }
     return "?";
 }
@@ -634,6 +646,9 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
     };
     upload_cmdbuf = command_pool.Commit();
     Check(upload_cmdbuf.begin(begin_info));
+    // GPU black box: the number taken when the session began, before its own start mark.
+    GpuCrashDiag::WriteReservedBox(static_cast<VkCommandBuffer>(upload_cmdbuf), this,
+                                   sessions.back().upload_mark);
     return upload_cmdbuf;
 }
 
@@ -732,6 +747,15 @@ void Scheduler::BeginSession() {
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    // GPU black box: the start of the command buffer (and of its upload buffer, which runs
+    // first), so a hang before its first marked command is not blamed on the previous one.
+    if (GpuCrashDiag::Blackbox()) {
+        GpuCrashDiag::Entry entry{.kind = GpuCrashDiag::Kind::SessionUploads};
+        sessions.back().upload_mark =
+            GpuCrashDiag::ReserveBox(this, CurrentTick(), entry, GpuCrashDiag::Context{});
+        entry.kind = GpuCrashDiag::Kind::SessionStart;
+        GpuCrashDiag::MarkBox(this, Recorder(), CurrentTick(), entry, GpuCrashDiag::Context{});
+    }
     ProfileSessionBegin();
     session_used = false;
     if (iss::timeline::enabled) {
@@ -764,6 +788,11 @@ void Scheduler::EndSession() {
     }
 
     EndRendering();
+    if (GpuCrashDiag::Blackbox()) {
+        GpuCrashDiag::MarkBox(this, Recorder(), CurrentTick(),
+                              GpuCrashDiag::Entry{.kind = GpuCrashDiag::Kind::SessionEnd},
+                              GpuCrashDiag::Context{});
+    }
     ProfileSessionEnd();
     if (session.primary) {
         Check(session.primary.end());
@@ -969,6 +998,11 @@ void Scheduler::SubmitToQueue(std::span<const vk::CommandBuffer> cmd_buffers, Su
     }
     const u64 submit_begin_ns = iss::timeline::enabled ? Common::Perf::NowNs() : 0;
     GpuCrashDiag::NoteSubmit(this, name);
+    GpuCrashDiag::NoteSubmitSemaphores(
+        this, std::span{info.wait_semas.data(), info.num_wait_semas},
+        std::span{info.wait_ticks.data(), info.num_wait_semas},
+        std::span{info.signal_semas.data(), info.num_signal_semas},
+        std::span{info.signal_ticks.data(), info.num_signal_semas});
     auto submit_result = queue.submit(submit_info, info.fence);
     const u64 submit_end_ns = iss::timeline::enabled ? Common::Perf::NowNs() : 0;
     if (iss::timeline::enabled) {

@@ -768,6 +768,7 @@ private:
     struct Session {
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};
+        u64 upload_mark{}; ///< GPU black box: written at the start of the upload buffer.
     };
     std::vector<Session> sessions;
     std::condition_variable_any event_cv;
@@ -1375,6 +1376,12 @@ enum class Kind : u32 {
     NativeSegment, ///< GPU black box: a native pass segment executed by the command processor.
     NativeDraw,    ///< GPU black box: a draw inside a native segment.
     Present,       ///< GPU black box: the presenter's passes (FSR, post process) of a frame.
+    PresentEnd,    ///< GPU black box: after them.
+    SessionStart,  ///< GPU black box: the start of a command buffer (before its first command).
+    SessionUploads, ///< GPU black box: its upload command buffer, submitted right before it.
+    SessionEnd,    ///< GPU black box: the end of a command buffer.
+    PresentWindow, ///< GPU black box: the present thread's copy to the swapchain image (ImGui).
+    Readback,      ///< GPU black box: a readback queue submission (buffer copies to the host).
 };
 
 struct Entry {
@@ -1417,6 +1424,17 @@ void MarkNativeDraw(VkCommandBuffer cmd, u32 segment, u32 draw, const Entry& ent
 
 /// GPU black box: the scheduler `owner` submitted everything it marked so far.
 void NoteSubmit(const void* owner, const char* name);
+
+/// GPU black box: the semaphores the submission just noted waits for and signals (values; 0 for
+/// a binary semaphore), listed in the report.
+void NoteSubmitSemaphores(const void* owner, std::span<const vk::Semaphore> waits,
+                          std::span<const u64> wait_values, std::span<const vk::Semaphore> signals,
+                          std::span<const u64> signal_values);
+
+/// GPU black box: a mark whose number is taken now (in order with MarkBox) and written later
+/// with WriteReservedBox into another command buffer that runs first (an upload buffer).
+u64 ReserveBox(const void* owner, u64 tick, const Entry& entry, const Context& ctx);
+void WriteReservedBox(VkCommandBuffer cmd, const void* owner, u64 seq);
 
 /// GPU black box: writes gpu-crash.txt/.json (device lost), once.
 void BlackboxCrash(const char* where);
