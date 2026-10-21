@@ -57,6 +57,13 @@ ImGuiID NewFrame(bool reused){
             return v;}();
         static size_t next_shot=0;
         if(next_shot<shots.size()&&tick>=shots[next_shot]){++next_shot;VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);}
+        // ISS_SHOT_WINDOW_AT=s1,s2,...: what the window shows (presentation and overlays) instead.
+        static std::vector<uint64_t> window_shots=[]{
+            std::vector<uint64_t> v;const char *p=std::getenv("ISS_SHOT_WINDOW_AT");
+            while(p&&*p){v.push_back(uint64_t(std::strtoull(p,nullptr,10))*1000);const char *c=std::strchr(p,',');p=c?c+1:nullptr;}
+            return v;}();
+        static size_t next_window_shot=0;
+        if(next_window_shot<window_shots.size()&&tick>=window_shots[next_window_shot]){++next_window_shot;VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::WithOverlays);}
         // ISS_SHOT_FLIPS=n1,n2,...: at these guest flips instead (the same game frame in an A/B,
         // whatever the startup took).
         static std::vector<uint64_t> flip_shots=[]{

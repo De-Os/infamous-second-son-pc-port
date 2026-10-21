@@ -120,6 +120,23 @@ static bool SimpleScalingEnabled() {
 /// The intermediate image of the simple scaling (one, the size of the game image).
 static Frame g_scaling_frame{};
 
+// ISS_PRESENT_DIRECT=1 (AMD test): no post process (nor FSR) shader in the presentation: the game
+// image is blitted into the frame (linear filter when the sizes differ). Lost: the post process
+// gamma (an sRGB game image is blitted as its linear values: darker), the 10-bit sRGB decode and
+// HDR output. On an RX 7800 XT the post process pass never finished whenever the game image was
+// not 1920x1080 (2560x1080 -> 2560x1080 too).
+static bool PresentDirectEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ISS_PRESENT_DIRECT");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+/// Direct present: per frame (by id) a view of the frame image with alpha 1 for ImGui (the
+/// blit copies the game's alpha; the post process pass wrote 1).
+static std::array<vk::ImageView, 256> g_opaque_views{};
+
 static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_width,
                            s32 swapchain_height) {
     float frame_aspect = static_cast<float>(frame_width) / frame_height;
@@ -537,6 +554,9 @@ Presenter::~Presenter() {
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
     }
+    for (auto& view : g_opaque_views) {
+        if (view) device.destroyImageView(std::exchange(view, vk::ImageView{}));
+    }
     if (g_scaling_frame.image) {
         device.destroyImageView(g_scaling_frame.image_view);
         vmaDestroyImage(instance.GetAllocator(), g_scaling_frame.image, g_scaling_frame.allocation);
@@ -612,7 +632,17 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->width = width;
     frame->height = height;
 
-    frame->imgui_texture = ImGui::Vulkan::AddTexture(view, vk::ImageLayout::eShaderReadOnlyOptimal);
+    vk::ImageView texture_view = view;
+    if (PresentDirectEnabled()) {
+        if (auto& old = g_opaque_views[frame->id]) device.destroyImageView(old);
+        auto opaque_info = view_info;
+        opaque_info.components.a = vk::ComponentSwizzle::eOne;
+        g_opaque_views[frame->id] =
+            Check<"create frame image view">(device.createImageView(opaque_info));
+        texture_view = g_opaque_views[frame->id];
+    }
+    frame->imgui_texture =
+        ImGui::Vulkan::AddTexture(texture_view, vk::ImageLayout::eShaderReadOnlyOptimal);
     frame->is_hdr = swapchain.GetHDR();
 }
 
@@ -732,22 +762,39 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const auto& game_info = texture_cache.GetImage(image_id).info;
     const bool scaled = game_info.size.width != frame->width ||
                         game_info.size.height != frame->height;
-    const bool simple_scaling = SimpleScalingEnabled() && !fsr_settings.enable && scaled;
+    const bool direct = PresentDirectEnabled();
+    const bool simple_scaling = !direct && SimpleScalingEnabled() && !fsr_settings.enable && scaled;
     {
         // Logged when the sizes or the path change.
         static u64 logged = ~u64{0};
         const u64 key = (u64(game_info.size.width) << 48) ^ (u64(game_info.size.height) << 32) ^
                         (u64(frame->width) << 16) ^ frame->height ^ (u64(simple_scaling) << 63) ^
-                        (u64(fsr_settings.enable) << 62);
+                        (u64(fsr_settings.enable) << 62) ^ (u64(direct) << 61);
         if (key != logged) {
             logged = key;
             std::fprintf(stderr, "PRESENT_SCALING %s: game %ux%u -> frame %ux%u\n",
-                         fsr_settings.enable ? "fsr" : simple_scaling ? "simple (post process at "
+                         direct ? (scaled ? "direct (blit, linear, no post process)"
+                                          : "direct (blit 1:1, no post process)")
+                         : fsr_settings.enable ? "fsr" : simple_scaling ? "simple (post process at "
                          "the game size, linear blit)" : scaled ? "post process pass" : "none",
                          game_info.size.width, game_info.size.height, frame->width, frame->height);
+            const auto& image = texture_cache.GetImage(image_id);
+            std::fprintf(stderr,
+                         "PRESENT_IMAGE attribute %ux%u pitch %u tiling %u at %llx -> image uid "
+                         "%llu %ux%u pitch %u tile %u %s guest size %x levels %u layers %u "
+                         "samples %u render target %u\n",
+                         attribute.attrib.width, attribute.attrib.height,
+                         attribute.attrib.pitch_in_pixel,
+                         static_cast<u32>(attribute.attrib.tiling_mode),
+                         (unsigned long long)cpu_address, (unsigned long long)image.image_uid,
+                         game_info.size.width, game_info.size.height, game_info.pitch,
+                         static_cast<u32>(game_info.tile_mode),
+                         vk::to_string(game_info.pixel_format).c_str(), game_info.guest_size,
+                         game_info.resources.levels, game_info.resources.layers,
+                         game_info.num_samples, u32(image.usage.render_target));
         }
     }
-    const bool streamed = present_stream && !fsr_settings.enable && !simple_scaling &&
+    const bool streamed = present_stream && !fsr_settings.enable && !simple_scaling && !direct &&
                           !draw_scheduler.DirectCommandBuffer();
     vk::CommandBuffer cmdbuf{};
     if (!streamed) {
@@ -823,8 +870,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
-    runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
-                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
+    if (direct) {
+        runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead);
+    } else {
+        runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eFragmentShader,
+                        vk::AccessFlagBits2::eShaderRead);
+    }
     runtime.FlushBarriers();
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
@@ -860,6 +913,132 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             });
         // The pass binds its own pipeline and dynamic state behind the tracking.
         draw_scheduler.GetDynamicState().binds.Forget();
+    } else if (direct) {
+        constexpr vk::ImageSubresourceRange color{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .levelCount = 1,
+            .layerCount = 1,
+        };
+        // The frame was made a color attachment above; its contents are replaced.
+        const vk::ImageMemoryBarrier2 to_blit{
+            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = frame->image,
+            .subresourceRange = color,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &to_blit,
+        });
+        // A blit reads the game image by its own format (R8G8B8A8 sRGB) while its bytes are in the
+        // order of the view format (B8G8R8A8 for A8R8G8B8), and decodes sRGB. The bytes are
+        // copied first into an image of the view format without sRGB, blitted from there: the
+        // frame gets the encoded colors in the right order, as the post process pass writes them.
+        static Frame raw{};
+        static vk::Format raw_format{};
+        vk::Format unorm = view_info.format;
+        if (unorm == vk::Format::eR8G8B8A8Srgb) unorm = vk::Format::eR8G8B8A8Unorm;
+        if (unorm == vk::Format::eB8G8R8A8Srgb) unorm = vk::Format::eB8G8R8A8Unorm;
+        if (!raw.image || raw.width != image_size.width || raw.height != image_size.height ||
+            raw_format != unorm) {
+            if (raw.image) {
+                // Freed once the GPU is past the commands that use it.
+                draw_scheduler.DeferOperation(
+                    [allocator = instance.GetAllocator(), old = raw] {
+                        vmaDestroyImage(allocator, old.image, old.allocation);
+                    });
+            }
+            raw = {};
+            const vk::ImageCreateInfo raw_ci = {
+                .imageType = vk::ImageType::e2D,
+                .format = unorm,
+                .extent = {image_size.width, image_size.height, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .usage = vk::ImageUsageFlagBits::eTransferDst |
+                         vk::ImageUsageFlagBits::eTransferSrc,
+            };
+            const VmaAllocationCreateInfo alloc_ci = {
+                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            };
+            const VkImageCreateInfo unsafe_ci = static_cast<VkImageCreateInfo>(raw_ci);
+            VkImage unsafe_image{};
+            const VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_ci, &alloc_ci,
+                                                   &unsafe_image, &raw.allocation, nullptr);
+            ASSERT_MSG(result == VK_SUCCESS, "Failed allocating the direct present image: {}",
+                       vk::to_string(vk::Result{result}));
+            raw.image = vk::Image{unsafe_image};
+            raw.width = image_size.width;
+            raw.height = image_size.height;
+            raw_format = unorm;
+        }
+        // The previous frame's blit read it.
+        const vk::ImageMemoryBarrier2 raw_to_copy{
+            .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = raw.image,
+            .subresourceRange = color,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &raw_to_copy,
+        });
+        const vk::ImageCopy copy{
+            .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+            .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+            .extent = {image_size.width, image_size.height, 1},
+        };
+        cmdbuf.copyImage(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal, raw.image,
+                         vk::ImageLayout::eTransferDstOptimal, copy);
+        const vk::ImageMemoryBarrier2 raw_to_blit{
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .image = raw.image,
+            .subresourceRange = color,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &raw_to_blit,
+        });
+        const vk::ImageBlit region{
+            .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{s32(image_size.width), s32(image_size.height), 1}},
+            .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{s32(frame->width), s32(frame->height), 1}},
+        };
+        cmdbuf.blitImage(raw.image, vk::ImageLayout::eTransferSrcOptimal, frame->image,
+                         vk::ImageLayout::eTransferDstOptimal, region,
+                         scaled ? vk::Filter::eLinear : vk::Filter::eNearest);
+        // As the post process pass leaves the frame: general layout, read by fragment shaders.
+        const vk::ImageMemoryBarrier2 frame_done{
+            .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = frame->image,
+            .subresourceRange = color,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &frame_done,
+        });
     } else if (simple_scaling) {
         Frame& mid = g_scaling_frame;
         const vk::Format format = swapchain.GetSurfaceFormat().format;

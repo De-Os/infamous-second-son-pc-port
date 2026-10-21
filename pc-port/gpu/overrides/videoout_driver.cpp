@@ -179,8 +179,21 @@ int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* co
         port->buffer_labels[startIndex + i] = 0;
         port->SignalVoLabel();
 
-        presenter->RegisterVideoOutSurface(group, address);
+        const auto& image = presenter->RegisterVideoOutSurface(group, address);
         LOG_INFO(Lib_VideoOut, "buffers[{}] = {:#x}", i + startIndex, address);
+        // What the game registers and the texture cache image it maps to (the pitch and size
+        // follow native/ultrawide.cpp's render size, or not).
+        std::fprintf(stderr,
+                     "VIDEOOUT_BUFFER %d at %llx: %ux%u pitch %u tiling %u format %.*s -> image uid "
+                     "%llu %ux%u pitch %u tile %u %s guest size %x\n",
+                     int(i + startIndex), (unsigned long long)address, attribute->width,
+                     attribute->height, attribute->pitch_in_pixel,
+                     static_cast<u32>(attribute->tiling_mode),
+                     int(GetPixelFormatString(attribute->pixel_format).size()),
+                     GetPixelFormatString(attribute->pixel_format).data(),
+                     (unsigned long long)image.image_uid, image.info.size.width,
+                     image.info.size.height, image.info.pitch, static_cast<u32>(image.info.tile_mode),
+                     vk::to_string(image.info.pixel_format).c_str(), image.info.guest_size);
     }
 
     return group_index;

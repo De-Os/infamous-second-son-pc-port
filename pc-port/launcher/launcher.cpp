@@ -118,6 +118,11 @@ std::vector<Setting> g_settings = {
     // scales it. A test for the GPU hang on AMD in the pass that scales.
     {"simple_scaling", L"Simple scaling (AMD test)", L"On: the picture is scaled by a copy, not by the shader.",
      {{L"Off", "0"}, {L"On", "1"}}, TabAdvanced},
+    // ISS_PRESENT_DIRECT (gpu/overrides/vk_presenter.cpp): no post process shader in the
+    // presentation, the game image is blitted into the window's picture (no gamma correction).
+    // A test for the GPU hang on AMD in that pass at sizes other than 1920x1080.
+    {"present_direct", L"Direct present (AMD test)", L"On: no post process shader; colors may be darker.",
+     {{L"Off", "0"}, {L"On", "1"}}, TabAdvanced},
     // The languages of the CUSA00004 package (the PS4 system language ids, src/services.c
     // ISS_LANGUAGE): ten with voices, the four Nordic ones subtitles only (English voices).
     {"language", L"Language", L"Text and voices. Nordic languages: subtitles only.",
@@ -724,6 +729,7 @@ std::wstring LaunchGame(HWND notify) {
     env[L"ISS_GPU_BLACKBOX"] = Widen(SettingValue("blackbox"));
     env[L"ISS_GPU_FEEDBACK_COPY"] = Widen(SettingValue("feedback_copy"));
     env[L"ISS_SIMPLE_SCALING"] = Widen(SettingValue("simple_scaling"));
+    env[L"ISS_PRESENT_DIRECT"] = Widen(SettingValue("present_direct"));
     if (const std::string memory = SettingValue("game_memory"); memory != "auto")
         env[L"ISS_DIRECT_MEMORY_MB"] = Widen(memory);
     env[L"ISS_UNIFIED_MEMORY"] = Widen(UnifiedMemoryValue());
