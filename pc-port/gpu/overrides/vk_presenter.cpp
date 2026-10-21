@@ -105,6 +105,21 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format for
     return MakeImageBlit(frame_width, frame_height, swapchain_width, swapchain_height, 0, 0);
 }
 
+// ISS_SIMPLE_SCALING=1 (AMD test): when the game image and the frame differ in size, the post
+// process pass runs at the game image's size into an intermediate image and a linear blit scales
+// that into the frame (on an RX 7800 XT the pass that scaled it itself never finished at
+// 2560x1440 -> 1920x1080 and 3440x1440 -> 2560x1071; 1920x1080 -> 1920x1080 worked).
+static bool SimpleScalingEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ISS_SIMPLE_SCALING");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+/// The intermediate image of the simple scaling (one, the size of the game image).
+static Frame g_scaling_frame{};
+
 static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_width,
                            s32 swapchain_height) {
     float frame_aspect = static_cast<float>(frame_width) / frame_height;
@@ -522,6 +537,11 @@ Presenter::~Presenter() {
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
     }
+    if (g_scaling_frame.image) {
+        device.destroyImageView(g_scaling_frame.image_view);
+        vmaDestroyImage(instance.GetAllocator(), g_scaling_frame.image, g_scaling_frame.allocation);
+        g_scaling_frame = {};
+    }
 }
 
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
@@ -709,7 +729,25 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         const char* value = std::getenv("ISS_PRESENT_STREAM");
         return value && value[0] == '1';
     }();
-    const bool streamed = present_stream && !fsr_settings.enable &&
+    const auto& game_info = texture_cache.GetImage(image_id).info;
+    const bool scaled = game_info.size.width != frame->width ||
+                        game_info.size.height != frame->height;
+    const bool simple_scaling = SimpleScalingEnabled() && !fsr_settings.enable && scaled;
+    {
+        // Logged when the sizes or the path change.
+        static u64 logged = ~u64{0};
+        const u64 key = (u64(game_info.size.width) << 48) ^ (u64(game_info.size.height) << 32) ^
+                        (u64(frame->width) << 16) ^ frame->height ^ (u64(simple_scaling) << 63) ^
+                        (u64(fsr_settings.enable) << 62);
+        if (key != logged) {
+            logged = key;
+            std::fprintf(stderr, "PRESENT_SCALING %s: game %ux%u -> frame %ux%u\n",
+                         fsr_settings.enable ? "fsr" : simple_scaling ? "simple (post process at "
+                         "the game size, linear blit)" : scaled ? "post process pass" : "none",
+                         game_info.size.width, game_info.size.height, frame->width, frame->height);
+        }
+    }
+    const bool streamed = present_stream && !fsr_settings.enable && !simple_scaling &&
                           !draw_scheduler.DirectCommandBuffer();
     vk::CommandBuffer cmdbuf{};
     if (!streamed) {
@@ -822,6 +860,135 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             });
         // The pass binds its own pipeline and dynamic state behind the tracking.
         draw_scheduler.GetDynamicState().binds.Forget();
+    } else if (simple_scaling) {
+        Frame& mid = g_scaling_frame;
+        const vk::Format format = swapchain.GetSurfaceFormat().format;
+        static vk::Format mid_format{};
+        if (!mid.image || mid.width != image_size.width || mid.height != image_size.height ||
+            mid_format != format) {
+            if (mid.image) {
+                // Freed once the GPU is past the commands that use it.
+                draw_scheduler.DeferOperation([device = instance.GetDevice(),
+                                               allocator = instance.GetAllocator(), old = mid] {
+                    device.destroyImageView(old.image_view);
+                    vmaDestroyImage(allocator, old.image, old.allocation);
+                });
+            }
+            mid = {};
+            const vk::ImageCreateInfo image_ci = {
+                .imageType = vk::ImageType::e2D,
+                .format = format,
+                .extent = {image_size.width, image_size.height, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .usage = vk::ImageUsageFlagBits::eColorAttachment |
+                         vk::ImageUsageFlagBits::eTransferSrc,
+            };
+            const VmaAllocationCreateInfo alloc_ci = {
+                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            };
+            const VkImageCreateInfo unsafe_ci = static_cast<VkImageCreateInfo>(image_ci);
+            VkImage unsafe_image{};
+            const VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_ci, &alloc_ci,
+                                                   &unsafe_image, &mid.allocation, nullptr);
+            ASSERT_MSG(result == VK_SUCCESS, "Failed allocating the scaling image: {}",
+                       vk::to_string(vk::Result{result}));
+            mid.image = vk::Image{unsafe_image};
+            SetObjectName(instance.GetDevice(), mid.image, "Simple scaling image {}x{}",
+                          image_size.width, image_size.height);
+            mid.image_view = Check<"create scaling image view">(instance.GetDevice().createImageView(
+                vk::ImageViewCreateInfo{
+                    .image = mid.image,
+                    .viewType = vk::ImageViewType::e2D,
+                    .format = format,
+                    .subresourceRange{
+                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+                        .levelCount = 1,
+                        .layerCount = 1,
+                    },
+                }));
+            mid.width = image_size.width;
+            mid.height = image_size.height;
+            mid_format = format;
+        }
+
+        constexpr vk::ImageSubresourceRange color{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .levelCount = 1,
+            .layerCount = 1,
+        };
+        // The previous frame's blit read the intermediate image.
+        const vk::ImageMemoryBarrier2 mid_to_attachment{
+            .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .image = mid.image,
+            .subresourceRange = color,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &mid_to_attachment,
+        });
+        // The same pass as without scaling (game image size in and out); it leaves the image in the
+        // general layout.
+        pp_pass.Render(cmdbuf, image_view, image_size, mid, pp_settings);
+
+        const std::array to_blit{
+            vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .image = mid.image,
+                .subresourceRange = color,
+            },
+            // The frame was made a color attachment by PrepareFrame; its contents are replaced.
+            vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
+                .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .image = frame->image,
+                .subresourceRange = color,
+            },
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = static_cast<u32>(to_blit.size()),
+            .pImageMemoryBarriers = to_blit.data(),
+        });
+        const vk::ImageBlit region{
+            .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{s32(image_size.width), s32(image_size.height), 1}},
+            .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{s32(frame->width), s32(frame->height), 1}},
+        };
+        cmdbuf.blitImage(mid.image, vk::ImageLayout::eTransferSrcOptimal, frame->image,
+                         vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eLinear);
+        // As the post process pass leaves the frame: general layout, read by fragment shaders.
+        const vk::ImageMemoryBarrier2 frame_done{
+            .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = frame->image,
+            .subresourceRange = color,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &frame_done,
+        });
     } else {
         image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);

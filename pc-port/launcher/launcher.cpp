@@ -113,6 +113,11 @@ std::vector<Setting> g_settings = {
     // above 1920x1080 (the game's heap, where its render targets live, ran out at 5120x1440).
     {"game_memory", L"Game memory", L"Auto: 4.5 GB, 5.5 GB above 1920x1080.",
      {{L"Auto", "auto"}, {L"4.5 GB", "4608"}, {L"5.5 GB", "5632"}}, TabAdvanced},
+    // ISS_SIMPLE_SCALING (gpu/overrides/vk_presenter.cpp): when the game image and the window's
+    // picture differ in size, the post process pass runs at the game size and a linear blit
+    // scales it. A test for the GPU hang on AMD in the pass that scales.
+    {"simple_scaling", L"Simple scaling (AMD test)", L"On: the picture is scaled by a copy, not by the shader.",
+     {{L"Off", "0"}, {L"On", "1"}}, TabAdvanced},
     // The languages of the CUSA00004 package (the PS4 system language ids, src/services.c
     // ISS_LANGUAGE): ten with voices, the four Nordic ones subtitles only (English voices).
     {"language", L"Language", L"Text and voices. Nordic languages: subtitles only.",
@@ -718,6 +723,7 @@ std::wstring LaunchGame(HWND notify) {
     env[L"ISS_ASYNC_SKIP_DRAWS"] = Widen(SettingValue("shader_mode"));
     env[L"ISS_GPU_BLACKBOX"] = Widen(SettingValue("blackbox"));
     env[L"ISS_GPU_FEEDBACK_COPY"] = Widen(SettingValue("feedback_copy"));
+    env[L"ISS_SIMPLE_SCALING"] = Widen(SettingValue("simple_scaling"));
     if (const std::string memory = SettingValue("game_memory"); memory != "auto")
         env[L"ISS_DIRECT_MEMORY_MB"] = Widen(memory);
     env[L"ISS_UNIFIED_MEMORY"] = Widen(UnifiedMemoryValue());
