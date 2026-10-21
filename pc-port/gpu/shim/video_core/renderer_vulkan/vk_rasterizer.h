@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -676,6 +677,10 @@ private:
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    /// A draw samples one of its own targets: logs it once per shader and target, and with
+    /// ISS_GPU_FEEDBACK_COPY=1 returns the view of a copy made before the draw (else null).
+    vk::ImageView FeedbackTexture(const Shader::Info& stage, VideoCore::ImageId image_id,
+                                  VideoCore::Image& image, const VideoCore::ImageViewInfo& view_info);
     bool BindResources(const Pipeline* pipeline,
                        const Shader::PushData* captured_push_data = nullptr,
                        bool skip_compute_hle = false);
@@ -1139,6 +1144,22 @@ private:
     };
     mutable NativeDrawState native_draw_state{};
     bool attachment_feedback_loop{};
+    /// ISS_GPU_FEEDBACK_COPY: copies of images a draw samples while it draws into them, reused
+    /// by images of the same shape (filled again before a draw that needs it).
+    struct FeedbackCopy {
+        VideoCore::Image::BackingImage backing;
+        std::vector<VideoCore::ImageView> views;
+        const void* source{}; ///< The backing copied, last used by the draw bind_seq.
+        u64 bind_seq{};
+        bool current{}; ///< Only draws that sampled this copy ran since it was made.
+    };
+    std::deque<FeedbackCopy> feedback_copies;
+    u64 feedback_copies_made{};
+    /// The draw samples copies of its targets (FeedbackTexture): no loop left for the GPU, but
+    /// the draw counts as a feedback loop for the paths that reuse draws (BeginRendering).
+    bool attachment_feedback_copy{};
+    /// The pipeline BindResources binds (FeedbackTexture names its shaders).
+    const Pipeline* bind_pipeline{};
     bool needs_barrier{};
     /// Entries per stage type, indexed by shader, user data (the material) and first bindings.
     static constexpr u32 StageMemoBits = 11;

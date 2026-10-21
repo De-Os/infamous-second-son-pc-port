@@ -792,6 +792,23 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    // GPU black box: the presenter's passes follow the frame's last draw in its command buffer.
+    // Marked, a hang in them is no longer blamed on that draw.
+    if (GpuCrashDiag::Blackbox()) {
+        const GpuCrashDiag::Entry entry{
+            .kind = GpuCrashDiag::Kind::Present,
+            .count = frame->width,
+            .instances = frame->height,
+            .dims = {image_size.width, image_size.height, 1},
+            .address = image.info.guest_address,
+        };
+        GpuCrashDiag::Context ctx{};
+        ctx.tex_uid[0] = image.image_uid;
+        ctx.tex_addr[0] = image.info.guest_address;
+        GpuCrashDiag::MarkBox(&draw_scheduler,
+                              streamed ? draw_scheduler.Recorder() : CommandRecorder{cmdbuf},
+                              draw_scheduler.CurrentTick(), entry, ctx);
+    }
     if (streamed) {
         draw_scheduler.Recorder().Record(
             [this, pre_barrier, image_view, image_size, frame, settings = pp_settings](

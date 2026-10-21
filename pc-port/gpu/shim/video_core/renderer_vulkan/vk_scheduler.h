@@ -1374,6 +1374,7 @@ enum class Kind : u32 {
     Tile,
     NativeSegment, ///< GPU black box: a native pass segment executed by the command processor.
     NativeDraw,    ///< GPU black box: a draw inside a native segment.
+    Present,       ///< GPU black box: the presenter's passes (FSR, post process) of a frame.
 };
 
 struct Entry {

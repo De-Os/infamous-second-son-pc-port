@@ -228,6 +228,7 @@ const char* KindText(Kind kind) {
     case Kind::Tile: return "tile de imagem";
     case Kind::NativeSegment: return "SEGMENTO NATIVO";
     case Kind::NativeDraw: return "desenho nativo";
+    case Kind::Present: return "APRESENTACAO (FSR/pos-processo do quadro)";
     }
     return "?";
 }
@@ -270,6 +271,11 @@ std::string Describe(const Entry& e, const Context& c) {
     case Kind::Tile:
         std::snprintf(text, sizeof(text), "%s %ux%ux%u em %llx", KindText(e.kind), e.dims[0],
                       e.dims[1], e.dims[2], (unsigned long long)e.address);
+        return text;
+    case Kind::Present:
+        std::snprintf(text, sizeof(text), "%s quadro %ux%u em %llx -> janela %ux%u",
+                      KindText(e.kind), e.dims[0], e.dims[1], (unsigned long long)e.address,
+                      e.count, e.instances);
         return text;
     case Kind::NativeSegment:
         std::snprintf(text, sizeof(text), "%s id %llu com %u desenhos, area %ux%u%s",

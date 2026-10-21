@@ -103,6 +103,12 @@ std::vector<Setting> g_settings = {
     // shader (cs ce1675e0) took 33-50 ms instead of 0.9: 22 FPS instead of 117 at 1080p.
     {"gpu_memory", L"GPU memory", L"Auto: copies in video memory on NVIDIA, in place on others.",
      {{L"Auto", "auto"}, {L"In place", "1"}, {L"Video memory", "0"}}, TabGraphics},
+    // ISS_GPU_FEEDBACK_COPY (gpu/overrides/vk_rasterizer.cpp, FeedbackTexture): a draw that samples
+    // one of its own targets samples a copy made before it, once for a run of such draws (2) or
+    // before each one (1, half the frame rate at 3440x1440 on an RTX 5070 Ti). A test for the GPU
+    // hangs on AMD at sizes other than 1920x1080; the logs name such draws either way (GPU_FEEDBACK).
+    {"feedback_copy", L"Feedback copy (AMD test)", L"Draws that read their own target read a copy.",
+     {{L"Off", "0"}, {L"On", "2"}, {L"On, every draw (slow)", "1"}}, TabAdvanced},
     // The languages of the CUSA00004 package (the PS4 system language ids, src/services.c
     // ISS_LANGUAGE): ten with voices, the four Nordic ones subtitles only (English voices).
     {"language", L"Language", L"Text and voices. Nordic languages: subtitles only.",
@@ -707,6 +713,7 @@ std::wstring LaunchGame(HWND notify) {
     env[L"ISS_HUD_ASPECT"] = Widen(SettingValue("hud_width"));
     env[L"ISS_ASYNC_SKIP_DRAWS"] = Widen(SettingValue("shader_mode"));
     env[L"ISS_GPU_BLACKBOX"] = Widen(SettingValue("blackbox"));
+    env[L"ISS_GPU_FEEDBACK_COPY"] = Widen(SettingValue("feedback_copy"));
     env[L"ISS_UNIFIED_MEMORY"] = Widen(UnifiedMemoryValue());
     env[L"ISS_LANGUAGE"] = Widen(SettingValue("language"));
     if (const std::string map = PadMapString(); !map.empty()) env[L"ISS_PAD_MAP"] = Widen(map);

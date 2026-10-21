@@ -103,6 +103,8 @@ const char* KindName(Kind kind) {
         return "native segment";
     case Kind::NativeDraw:
         return "native segment draw";
+    case Kind::Present:
+        return "present";
     }
     return "?";
 }

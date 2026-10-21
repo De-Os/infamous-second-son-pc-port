@@ -114,6 +114,7 @@ The whole controller is on the keyboard too, while the game window has the focus
   - GPU memory: Auto reads the game's memory from copies in video memory on NVIDIA (`ISS_UNIFIED_MEMORY=0`) and in place elsewhere. On an RTX 5070 Ti the in-place reads went over PCIe: the tiled lighting shader took 33-50 ms per frame, 22 FPS instead of 117 at 1080p.
 
   Wider than 16:9 keeps the game's vertical view and shows more to the sides (Hor+); the menus and HUD keep their size. See [Ultrawide](#ultrawide).
+- **Advanced:** GPU crash diagnostics, and Feedback copy (AMD test, `ISS_GPU_FEEDBACK_COPY`): a draw that samples one of its own render targets (G-buffer decals, some full-screen passes) samples a copy of it made before the draw, once for a run of such draws (On, `2`) or before each one (`1`, half the frame rate). Off by default; the log names such draws either way (`GPU_FEEDBACK`).
 - **Game:** the language, from the 14 the CUSA00004 package ships: English, French, Italian, German, Spanish, Dutch, Portuguese, Russian, Polish and Turkish (text and voices), Danish, Finnish, Norwegian and Swedish (subtitles, English voices).
 - **CONTROLS:** the controller layout described above.
 - **Shader cache:** it builds up from session to session. A session that crashes is rolled back, so a bad cache never sticks.

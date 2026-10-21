@@ -13,6 +13,7 @@
 #include "deep_profile.h"
 #include "feedback_join.h"
 #include "infamous_renderer/secondary_batch_probe.h"
+#include <mutex>
 #include <unordered_set>
 #include <cstdio>
 #include <intrin.h>
@@ -213,6 +214,9 @@ void BlackboxImages(GpuCrashDiag::Context& ctx, const Images& images, Cache& cac
         if (n >= 8) break;
         if (!id) continue;
         const auto& image = cache.GetImage(id);
+        // The draw's targets are in the list too: only the images its shaders sample (a target
+        // listed as "tex" is then a real feedback loop).
+        if (!image.binding.is_bound) continue;
         bool seen = false;
         for (u32 i = 0; i < n; ++i) seen |= ctx.tex_uid[i] == image.image_uid;
         if (seen) continue;
@@ -3373,6 +3377,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
     const iss::cp_path::Scope cp_path_scope{iss::cp_path::BindRes};
     iss::feedback_join::BeginBindings();
     ++bind_resources_seq;
+    bind_pipeline = pipeline;
+    attachment_feedback_copy = false;
     auto& set_write_index = ComputeBindingsActive() ? compute_bindings.set_write_index
                                                     : this->set_write_index;
     auto& set_writes = ComputeBindingsActive() ? compute_bindings.set_writes : this->set_writes;
@@ -3472,8 +3478,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
             continue;
         }
         if (cycles) t0 = __rdtsc();
+        const u64 copies_before = feedback_copies_made;
         BindBuffers(*stage, binding, push_data);
         BindTextures(*stage, binding);
+        // A feedback copy's view is good for this draw only: not remembered.
+        if (feedback_copies_made != copies_before && capture.active) {
+            needs_barrier |= capture.barrier_before;
+            capture.active = false;
+        }
         uses_dma |= stage->uses_dma;
         if (cycles) {
             const u64 t1 = __rdtsc();
@@ -3768,6 +3780,11 @@ void Rasterizer::ResetBindings(bool is_compute) {
     bound_images.clear();
     bound_buffers.clear();
     needs_barrier = false;
+    if (!is_compute) {
+        attachment_feedback_copy = false;
+    } else {
+        for (auto& c : feedback_copies) c.current = false;
+    }
 }
 
 void Rasterizer::RecordSkippedWrites(const Pipeline& pipeline) {
@@ -4605,6 +4622,32 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             const auto binding = image.binding;
 
+            // A texture that is also a target of this draw (logged once). With
+            // ISS_GPU_FEEDBACK_COPY the draw samples a copy of it made before the draw.
+            if (binding.is_target && !is_storage && !ComputeBindingsActive()) {
+                if (const vk::ImageView copy_view =
+                        FeedbackTexture(stage, image_id, image, desc.view_info)) {
+                    image.usage.texture = 1u;
+                    image_infos.emplace_back(VK_NULL_HANDLE, copy_view,
+                                             vk::ImageLayout::eShaderReadOnlyOptimal);
+                    if (native_image_capture) {
+                        native_image_capture->push_back(NativeImageCapture{
+                            .id = image_id,
+                            .uid = image.image_uid,
+                            .backing = image.backing,
+                            .view = copy_view,
+                            .layout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                            .range = desc.view_info.range,
+                            .generation = texture_cache.ImageGeneration(image_id),
+                            .plain = false,
+                        });
+                    }
+                    if (native_access_audit)
+                        native_access_audit->images[binding_idx].hazard_after = runtime.HazardSeq();
+                    continue;
+                }
+            }
+
             // The image is either bound as storage in a separate descriptor or bound as render
             // target in feedback loop. Depth images are excluded because they can't be bound as
             // storage and feedback loop doesn't make sense for them
@@ -4732,6 +4775,200 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 }
 
+/// ISS_GPU_FEEDBACK_COPY: a draw that samples one of its own targets (a color buffer, or the
+/// depth buffer while depth writes are on) samples a copy of it made before the draw instead.
+/// 1: a copy before every such draw. 2: one copy for a run of such draws (decals one after the
+/// other): it is made again after any other draw or dispatch, so the draws of a run do not see
+/// each other's writes. 0 (default): the original handling (feedback loop layout, or the general
+/// layout without VK_EXT_attachment_feedback_loop_dynamic_state, as on AMD's Windows driver).
+static int FeedbackCopyMode() {
+    static const int mode = [] {
+        const char* value = std::getenv("ISS_GPU_FEEDBACK_COPY");
+        const int m = value && (value[0] == '1' || value[0] == '2') ? value[0] - '0' : 0;
+        if (m) std::fprintf(stderr, "GPU_FEEDBACK_COPY mode %d\n", m);
+        return m;
+    }();
+    return mode;
+}
+
+vk::ImageView Rasterizer::FeedbackTexture(const Shader::Info& stage, VideoCore::ImageId image_id,
+                                          VideoCore::Image& image,
+                                          const VideoCore::ImageViewInfo& view_info) {
+    // Which target of the draw it is. Sampling a depth buffer the draw only tests is no loop.
+    int target = -1;
+    if (db_desc.first == image_id) {
+        if (!db_desc.second.view_info.is_storage) return {};
+        target = 8;
+    } else {
+        for (u32 cb = 0; cb < cb_descs.size() && cb < 8; ++cb) {
+            if (cb_descs[cb].first == image_id) {
+                target = int(cb);
+                break;
+            }
+        }
+    }
+    if (target < 0) return {};
+    const int copy_mode = FeedbackCopyMode();
+
+    // Once per shader pair and target: what samples what.
+    u64 vs = 0, ps = 0;
+    if (bind_pipeline) {
+        for (const auto* s : bind_pipeline->GetStages()) {
+            if (!s) continue;
+            if (s->sw_stage == Shader::SwStage::Fragment) {
+                ps = s->pgm_hash;
+            } else if (s->sw_stage == Shader::SwStage::Vertex ||
+                       s->sw_stage == Shader::SwStage::TessellationEval) {
+                vs = s->pgm_hash;
+            }
+        }
+    }
+    {
+        static std::mutex mutex;
+        static std::unordered_set<u64> seen;
+        const u64 key = (vs * 0x9E3779B97F4A7C15ULL) ^ (ps << 4) ^ u64(target);
+        std::scoped_lock lock{mutex};
+        if (seen.size() < 256 && seen.insert(key).second) {
+            char where[8];
+            if (target == 8) {
+                std::snprintf(where, sizeof(where), "db");
+            } else {
+                std::snprintf(where, sizeof(where), "cb%d", target);
+            }
+            std::fprintf(stderr,
+                         "GPU_FEEDBACK draw vs %llx ps %llx: stage %llx samples uid %llu@%llx "
+                         "(%ux%u %s, mips %u+%u layers %u+%u), also its %s; copy=%s\n",
+                         (unsigned long long)vs, (unsigned long long)ps,
+                         (unsigned long long)stage.pgm_hash, (unsigned long long)image.image_uid,
+                         (unsigned long long)image.info.guest_address, image.info.size.width,
+                         image.info.size.height, vk::to_string(image.info.pixel_format).c_str(),
+                         u32(view_info.range.base.level), u32(view_info.range.extent.levels),
+                         u32(view_info.range.base.layer), u32(view_info.range.extent.layers),
+                         where, copy_mode == 2 ? "run" : copy_mode ? "on" : "off");
+        }
+    }
+    if (!copy_mode) return {};
+
+    // The copy: one filled for this draw from this image (or, mode 2, still current), else one
+    // of the same shape, preferably one that is not current.
+    vk::ImageCreateInfo copy_ci = image.backing->image.image_ci;
+    copy_ci.usage |= vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+    copy_ci.initialLayout = vk::ImageLayout::eUndefined;
+    FeedbackCopy* copy = nullptr;
+    for (auto& c : feedback_copies) {
+        if (c.source == image.backing &&
+            (c.bind_seq == bind_resources_seq || (copy_mode == 2 && c.current))) {
+            copy = &c;
+            break;
+        }
+    }
+    const bool fill = copy == nullptr;
+    if (!copy) {
+        for (auto& c : feedback_copies) {
+            if (c.bind_seq != bind_resources_seq && c.backing.image.image_ci == copy_ci &&
+                (!copy || copy->current)) {
+                copy = &c;
+            }
+        }
+    }
+    if (!copy) {
+        // Each shape keeps its copy for the run; past this many the draw is left as it is.
+        if (feedback_copies.size() >= 32) return {};
+        auto& c = feedback_copies.emplace_back();
+        c.backing.image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+        c.backing.image.Create(copy_ci);
+        c.backing.num_samples = image.backing->num_samples;
+        Vulkan::SetObjectName(instance.GetDevice(), c.backing.image.image,
+                              "Feedback copy {}x{} {}", copy_ci.extent.width,
+                              copy_ci.extent.height, vk::to_string(copy_ci.format));
+        copy = &c;
+    }
+
+    // Its view as the texture cache would make it for the image (ImageView reads the backing).
+    VideoCore::ImageView* view = nullptr;
+    for (auto& v : copy->views) {
+        if (v.info == view_info) {
+            view = &v;
+            break;
+        }
+    }
+    if (!view) {
+        auto* const original = image.backing;
+        image.backing = &copy->backing;
+        view = &copy->views.emplace_back(instance, view_info, image);
+        image.backing = original;
+    }
+
+    copy->bind_seq = bind_resources_seq;
+    if (fill) {
+        copy->source = image.backing;
+        copy->current = true;
+        runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+        scheduler.EndRendering();
+
+        const auto& ci = copy->backing.image.image_ci;
+        const bool is_3d = ci.imageType == vk::ImageType::e3D;
+        boost::container::small_vector<vk::ImageCopy, 16> regions;
+        for (u32 mip = 0; mip < ci.mipLevels; ++mip) {
+            const vk::ImageSubresourceLayers layers{
+                .aspectMask = image.aspect_mask,
+                .mipLevel = mip,
+                .baseArrayLayer = 0,
+                .layerCount = is_3d ? 1u : ci.arrayLayers,
+            };
+            regions.push_back(vk::ImageCopy{
+                .srcSubresource = layers,
+                .dstSubresource = layers,
+                .extent = {std::max(ci.extent.width >> mip, 1u),
+                           std::max(ci.extent.height >> mip, 1u),
+                           is_3d ? std::max(ci.extent.depth >> mip, 1u) : 1u},
+            });
+        }
+        const vk::ImageSubresourceRange all{
+            .aspectMask = image.aspect_mask,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
+        // The previous contents are not needed: the old layout is undefined.
+        const vk::ImageMemoryBarrier2 to_copy{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = copy->backing.image.image,
+            .subresourceRange = all,
+        };
+        const vk::ImageMemoryBarrier2 to_read{
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = copy->backing.image.image,
+            .subresourceRange = all,
+        };
+        const auto cmdbuf = scheduler.Recorder();
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                   .pImageMemoryBarriers = &to_copy});
+        cmdbuf.copyImage(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                         copy->backing.image.image, vk::ImageLayout::eTransferDstOptimal, regions);
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                   .pImageMemoryBarriers = &to_read});
+        ++feedback_copies_made;
+    }
+    // The target itself is not sampled any more: BeginRendering gives it the attachment layout.
+    image.binding.is_bound = 0u;
+    attachment_feedback_copy = true;
+    return *view->image_view;
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     const iss::cp_path::Scope cp_path_scope{iss::cp_path::BeginRender};
     iss::diagnostics::Scope phase_scope(iss::diagnostics::RenderTargets);
@@ -4800,6 +5037,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     }
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
         state.color_attachments[cb] = {};
+    }
+    // A draw that samples copies of its targets is not reused (fast draws, native passes) either.
+    attachment_feedback_loop |= attachment_feedback_copy;
+    // Any other draw may write what a copy was made from (ISS_GPU_FEEDBACK_COPY=2).
+    if (!attachment_feedback_copy) {
+        for (auto& c : feedback_copies) c.current = false;
     }
 
     if (auto image_id = db_desc.first; image_id) {
@@ -6116,7 +6359,8 @@ void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) cons
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.SetBlendConstants(regs.blend_constants);
     dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
-    dynamic_state.SetAttachmentFeedbackLoopEnabled(attachment_feedback_loop);
+    dynamic_state.SetAttachmentFeedbackLoopEnabled(attachment_feedback_loop &&
+                                                   !attachment_feedback_copy);
 }
 
 void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) {
