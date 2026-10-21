@@ -625,6 +625,52 @@ u32 NewNativeSegment() {
     return (box::g_segment.fetch_add(1, std::memory_order_relaxed) + 1) & 0xFFFFF;
 }
 
+namespace box {
+
+/// ISS_GPU_LABELS=1 (for Radeon GPU Detective): each mark also opens a Vulkan debug label
+/// region "#N <what the report says>" that the next mark of the command buffer closes; the start
+/// of a command buffer only opens one, its end only closes it.
+bool Labels() {
+    static const bool on = [] {
+        const char* p = std::getenv("ISS_GPU_LABELS");
+        const bool enabled = p && p[0] == '1';
+        if (enabled) std::fprintf(stderr, "GPU_LABELS on: debug label per black box mark\n");
+        return enabled;
+    }();
+    return on;
+}
+
+/// Command buffers with an open label (recorded by one thread at a time each).
+std::mutex g_label_mutex;
+std::unordered_map<VkCommandBuffer, bool> g_label_open;
+
+void Label(VkCommandBuffer cmd, Kind kind, const char* text) {
+    const auto& dld = VULKAN_HPP_DEFAULT_DISPATCHER;
+    if (!dld.vkCmdBeginDebugUtilsLabelEXT || !dld.vkCmdEndDebugUtilsLabelEXT) return;
+    bool open = false;
+    {
+        std::scoped_lock lock{g_label_mutex};
+        bool& state = g_label_open[cmd];
+        // A new command buffer (or one reset since) has no open label.
+        open = state && kind != Kind::SessionStart && kind != Kind::Readback;
+        state = kind != Kind::SessionEnd;
+    }
+    if (open) dld.vkCmdEndDebugUtilsLabelEXT(cmd);
+    if (kind == Kind::SessionEnd) return;
+    const VkDebugUtilsLabelEXT label{
+        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
+        .pLabelName = text,
+    };
+    dld.vkCmdBeginDebugUtilsLabelEXT(cmd, &label);
+}
+
+} // namespace box
+
+void CloseBoxLabel(VkCommandBuffer cmd) {
+    if (!box::Labels()) return;
+    box::Label(cmd, Kind::SessionEnd, nullptr);
+}
+
 void MarkBox(const void* owner, const CommandRecorder& cmdbuf, u64 tick, const Entry& entry,
              const Context& ctx) {
     if (!box::Ready()) return;
@@ -640,6 +686,15 @@ void MarkBox(const void* owner, const CommandRecorder& cmdbuf, u64 tick, const E
     item.paused = iss::pause_guard::active.load(std::memory_order_relaxed);
     item.time = box::Now();
     item.seq = seq;
+    if (box::Labels()) {
+        std::string text = "#" + std::to_string(seq) + " " + box::Describe(item.entry, ctx);
+        cmdbuf.Record([slot, seq, kind = entry.kind, text = std::move(text)](vk::CommandBuffer c) {
+            box::g_recorded[slot].store(seq, std::memory_order_relaxed);
+            box::WriteMarks(static_cast<VkCommandBuffer>(c), slot, u32(seq));
+            box::Label(static_cast<VkCommandBuffer>(c), kind, text.c_str());
+        });
+        return;
+    }
     cmdbuf.Record([slot, seq](vk::CommandBuffer c) {
         box::g_recorded[slot].store(seq, std::memory_order_relaxed);
         box::WriteMarks(static_cast<VkCommandBuffer>(c), slot, u32(seq));

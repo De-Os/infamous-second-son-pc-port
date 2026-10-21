@@ -1431,6 +1431,10 @@ void NoteSubmitSemaphores(const void* owner, std::span<const vk::Semaphore> wait
                           std::span<const u64> wait_values, std::span<const vk::Semaphore> signals,
                           std::span<const u64> signal_values);
 
+/// GPU black box (ISS_GPU_LABELS): closes the debug label of a command buffer that is not ended by
+/// a SessionEnd mark (readback).
+void CloseBoxLabel(VkCommandBuffer cmd);
+
 /// GPU black box: a mark whose number is taken now (in order with MarkBox) and written later
 /// with WriteReservedBox into another command buffer that runs first (an upload buffer).
 u64 ReserveBox(const void* owner, u64 tick, const Entry& entry, const Context& ctx);

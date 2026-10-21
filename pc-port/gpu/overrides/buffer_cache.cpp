@@ -874,6 +874,7 @@ u64 BufferCache::ReadbackQueue::Submit(std::span<const Job> jobs, std::span<cons
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &to_host,
     });
+    Vulkan::GpuCrashDiag::CloseBoxLabel(static_cast<VkCommandBuffer>(cmdbuf));
     Vulkan::Check(cmdbuf.end());
 
     const vk::Semaphore signal_semaphore = semaphore.Handle();

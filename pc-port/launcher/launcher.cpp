@@ -83,10 +83,12 @@ std::vector<Setting> g_settings = {
     // The picture size, field of view and HUD edges (native/ultrawide.cpp: ISS_RESOLUTION,
     // ISS_FOV, ISS_HUD_ASPECT). Wider than 16:9 keeps the vertical view and widens it.
     {"resolution", L"Resolution", L"Wider than 16:9 shows more to the sides. Desktop: your monitor's.",
-     {{L"1920x1080 (16:9)", "1920x1080"}, {L"2560x1440 (16:9)", "2560x1440"},
-      {L"3840x2160 (16:9)", "3840x2160"}, {L"2560x1080 (21:9)", "2560x1080"},
-      {L"3440x1440 (21:9)", "3440x1440"}, {L"3840x1600 (24:10)", "3840x1600"},
-      {L"3840x1080 (32:9)", "3840x1080"}, {L"5120x1440 (32:9)", "5120x1440"}, {L"Desktop", "desktop"}},
+     {{L"1920x1080 (16:9)", "1920x1080"}, {L"1280x720 (16:9)", "1280x720"},
+      {L"1600x900 (16:9)", "1600x900"}, {L"2560x1440 (16:9)", "2560x1440"},
+      {L"3840x2160 (16:9)", "3840x2160"}, {L"1720x720 (21:9)", "1720x720"},
+      {L"2560x1080 (21:9)", "2560x1080"}, {L"3440x1440 (21:9)", "3440x1440"},
+      {L"3840x1600 (24:10)", "3840x1600"}, {L"3840x1080 (32:9)", "3840x1080"},
+      {L"5120x1440 (32:9)", "5120x1440"}, {L"Desktop", "desktop"}},
      TabGraphics},
     {"fov", L"Field of view", L"100%: the game's own. Higher shows more around the camera.",
      {{L"100%", "100"}, {L"105%", "105"}, {L"110%", "110"}, {L"115%", "115"}, {L"120%", "120"},
@@ -98,6 +100,10 @@ std::vector<Setting> g_settings = {
      {{L"Wait", "0"}, {L"Skip", "1"}}, TabGraphics},
     {"blackbox", L"GPU crash diagnostics", L"Writes a report if the GPU hangs.",
      {{L"On", "1"}, {L"Off", "0"}}, TabAdvanced},
+    // ISS_GPU_LABELS (gpu/gpu_blackbox.inl): a Vulkan debug label per crash diagnostics mark, which
+    // Radeon GPU Detective shows in its report (named like the marks in gpu-crash.txt).
+    {"gpu_labels", L"GPU crash labels (RGD)", L"For Radeon GPU Detective reports. Slightly slower.",
+     {{L"Off", "0"}, {L"On", "1"}}, TabAdvanced},
     // ISS_UNIFIED_MEMORY: the GPU reads the game's memory in place (1) or from copies in video
     // memory (0). On an RTX 5070 Ti the in-place reads went over PCIe and the tiled lighting
     // shader (cs ce1675e0) took 33-50 ms instead of 0.9: 22 FPS instead of 117 at 1080p.
@@ -727,6 +733,7 @@ std::wstring LaunchGame(HWND notify) {
     env[L"ISS_HUD_ASPECT"] = Widen(SettingValue("hud_width"));
     env[L"ISS_ASYNC_SKIP_DRAWS"] = Widen(SettingValue("shader_mode"));
     env[L"ISS_GPU_BLACKBOX"] = Widen(SettingValue("blackbox"));
+    env[L"ISS_GPU_LABELS"] = Widen(SettingValue("gpu_labels"));
     env[L"ISS_GPU_FEEDBACK_COPY"] = Widen(SettingValue("feedback_copy"));
     env[L"ISS_SIMPLE_SCALING"] = Widen(SettingValue("simple_scaling"));
     env[L"ISS_PRESENT_DIRECT"] = Widen(SettingValue("present_direct"));
